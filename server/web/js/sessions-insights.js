@@ -227,6 +227,132 @@ function sess_renderTraceInsights(spans) {
 
 // ── Feature: Agent Hierarchy ──────────────────────────────────────────
 
+// Color palette for subagent types.
+var SESS_AGENT_COLORS = {
+  'explore': '#3b82f6',
+  'general-purpose': '#8b5cf6',
+  'code-review': '#10b981',
+  'rubber-duck': '#f59e0b',
+  'task': '#6b7280',
+  'configure-copilot': '#ec4899',
+};
+function sess_agentColor(type) {
+  if (SESS_AGENT_COLORS[type]) return SESS_AGENT_COLORS[type];
+  // Stable hash → HSL for unknown types.
+  var s = String(type || 'subagent'), h = 0;
+  for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return 'hsl(' + (Math.abs(h) % 360) + ', 55%, 55%)';
+}
+
+// Gantt chart: one row per subagent span + main envelope on top.
+function sess_renderSubagentGantt(agentSpans, sessionStart, sessionEnd, agentToolCounts) {
+  if (!agentSpans || agentSpans.length === 0) return '';
+  var totalMs = Math.max(sessionEnd - sessionStart, 1);
+  var mainTools = (agentToolCounts && agentToolCounts['']) || 0;
+
+  // Adaptive gridlines: aim for 6-10 ticks across the timeline.
+  var ticks = [];
+  var targetTicks = 8;
+  var rawStep = totalMs / targetTicks;
+  var niceSteps = [1000, 5000, 10000, 30000, 60000, 120000, 300000, 600000, 1800000, 3600000, 7200000, 21600000, 43200000, 86400000];
+  var step = niceSteps[niceSteps.length - 1];
+  for (var si = 0; si < niceSteps.length; si++) {
+    if (niceSteps[si] >= rawStep) { step = niceSteps[si]; break; }
+  }
+  function fmtGanttTick(ms) {
+    if (ms >= 3600000) return (ms / 3600000).toFixed(ms % 3600000 === 0 ? 0 : 1) + 'h';
+    if (ms >= 60000) return Math.round(ms / 60000) + 'm';
+    if (ms >= 1000) return Math.round(ms / 1000) + 's';
+    return ms + 'ms';
+  }
+  for (var tkMs = step; tkMs < totalMs; tkMs += step) {
+    ticks.push({ pct: (tkMs / totalMs) * 100, label: fmtGanttTick(tkMs) });
+  }
+
+  var html = '<details class="sess-section" open>';
+  html += '<summary>' + t('sessions.subagent_timeline') + ' (' + agentSpans.length + ')';
+  html += '<button class="sess-gantt-expand" onclick="event.preventDefault();event.stopPropagation();sess_togglePanel(\'left\')" title="' + t('ui.expand') + '">&#x21C9;</button>';
+  html += '</summary>';
+  html += '<div class="sess-gantt">';
+
+  // Gridlines (rendered once, as tick lines per row + labels only on axis header).
+  var gridLinesOnly = '<div class="sess-gantt-grid">';
+  for (var gi = 0; gi < ticks.length; gi++) {
+    gridLinesOnly += '<span class="sess-gantt-tick" style="left:' + ticks[gi].pct.toFixed(2) + '%"></span>';
+  }
+  gridLinesOnly += '</div>';
+
+  // Axis header row with labels.
+  html += '<div class="sess-gantt-row sess-gantt-axis">';
+  html += '<div class="sess-gantt-label"></div>';
+  html += '<div class="sess-gantt-track sess-gantt-axis-track">';
+  for (var gj = 0; gj < ticks.length; gj++) {
+    html += '<span class="sess-gantt-axis-label" style="left:' + ticks[gj].pct.toFixed(2) + '%">' +
+      ticks[gj].label + '</span>';
+  }
+  html += '</div></div>';
+
+  // Row: main envelope.
+  html += '<div class="sess-gantt-row">';
+  html += '<div class="sess-gantt-label"><span class="sess-gantt-type">' + t('sessions.agent_main') + '</span>';
+  html += '<span class="sess-gantt-sub">' + mainTools + ' ' + t('sessions.tools_suffix') + '</span></div>';
+  html += '<div class="sess-gantt-track">' + gridLinesOnly;
+  html += '<div class="sess-gantt-bar sess-gantt-main" style="left:0%;width:100%" title="' +
+    escapeHTML(t('sessions.agent_main')) + ' — ' + fmtDurMs(totalMs) + '"></div>';
+  html += '</div></div>';
+
+  // Rows: one per subagent.
+  for (var i = 0; i < agentSpans.length; i++) {
+    var sp = agentSpans[i];
+    var left = Math.max(0, (sp.start_ts - sessionStart) / totalMs * 100);
+    var width = Math.max(0.3, (sp.end_ts - sp.start_ts) / totalMs * 100);
+    if (left + width > 100) width = 100 - left;
+    var color = sess_agentColor(sp.agent_type);
+    var spTools = (agentToolCounts && agentToolCounts[sp.agent_id]) || sp.total_tool_calls || 0;
+    var tipParts = [
+      sp.agent_type,
+      'duration: ' + fmtDurMs(sp.duration_ms || (sp.end_ts - sp.start_ts)),
+    ];
+    if (sp.total_tokens > 0) tipParts.push('tokens: ' + fmtTokens(sp.total_tokens));
+    if (spTools > 0) tipParts.push(spTools + ' tools');
+    if (sp.model) tipParts.push(sp.model);
+    if (sp.incomplete) tipParts.push('(incomplete)');
+    var displayDesc = sp.task_description || sp.task_name || sp.description || '';
+    if (sp.task_prompt) tipParts.push('\u2014 ' + sp.task_prompt.slice(0, 200));
+    else if (displayDesc) tipParts.push('\u2014 ' + displayDesc);
+    var tip = tipParts.join(' · ');
+
+    html += '<div class="sess-gantt-row">';
+    html += '<div class="sess-gantt-label">';
+    html += '<span class="sess-gantt-dot" style="background:' + color + '"></span>';
+    html += '<span class="sess-gantt-type">' + escapeHTML(sp.agent_type || 'subagent') + '</span>';
+    if (spTools > 0 || sp.total_tokens > 0) {
+      html += '<span class="sess-gantt-sub">';
+      if (spTools > 0) html += spTools + 't';
+      if (sp.total_tokens > 0) html += (spTools > 0 ? ' · ' : '') + fmtTokens(sp.total_tokens);
+      html += '</span>';
+    }
+    html += '</div>';
+    html += '<div class="sess-gantt-track">' + gridLinesOnly;
+    html += '<div class="sess-gantt-bar' + (sp.incomplete ? ' sess-gantt-bar-incomplete' : '') +
+      '" style="left:' + left.toFixed(2) + '%;width:' + width.toFixed(2) + '%;background:' + color +
+      '" title="' + escapeHTML(tip) + '"></div>';
+    if (displayDesc) {
+      // Render description as caption: inside the bar if wide enough, else trailing it.
+      var captionLeft = (width >= 15) ? left : (left + width);
+      var captionMaxPct = 100 - captionLeft;
+      var inside = width >= 15;
+      html += '<div class="sess-gantt-caption' + (inside ? ' sess-gantt-caption-inside' : '') +
+        '" style="left:' + captionLeft.toFixed(2) + '%;max-width:' + captionMaxPct.toFixed(2) + '%">' +
+        escapeHTML(displayDesc) + '</div>';
+    }
+    html += '</div></div>';
+  }
+
+  html += '</div></details>';
+  return html;
+}
+
 function sess_renderAgentTree(agents, agentToolCounts) {
   var mainTools = agentToolCounts[''] || 0;
   var html = '<details class="sess-section">';

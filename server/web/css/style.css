@@ -804,6 +804,29 @@ tr.active-trace td { background: var(--bg-hover); }
 [data-theme="light"] .sess-file-bar-write { opacity: 0.6; }
 .sess-file-count { min-width: 28px; text-align: right; color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
 
+/* --- Subagent Gantt timeline --- */
+.sess-gantt-expand { float: right; background: transparent; border: 1px solid var(--border); color: var(--text-dim); width: 22px; height: 20px; line-height: 18px; padding: 0; border-radius: 3px; cursor: pointer; font-size: 12px; margin-left: 8px; }
+.sess-gantt-expand:hover { background: var(--bg); color: var(--text); border-color: var(--text-dim); }
+.sess-gantt { padding: 8px 0 4px; font-size: 12px; }
+.sess-gantt-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; min-height: 20px; }
+.sess-gantt-label { flex: 0 0 160px; display: flex; align-items: center; gap: 6px; overflow: hidden; }
+.sess-gantt-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.sess-gantt-type { font-weight: 600; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sess-gantt-sub { color: var(--text-dim); font-size: 10px; white-space: nowrap; font-variant-numeric: tabular-nums; margin-left: auto; }
+.sess-gantt-track { flex: 1; position: relative; height: 16px; background: var(--bg); border-radius: 3px; }
+.sess-gantt-bar { position: absolute; top: 2px; height: 12px; border-radius: 2px; opacity: 0.85; cursor: help; min-width: 2px; }
+.sess-gantt-bar:hover { opacity: 1; box-shadow: 0 0 0 1px rgba(255,255,255,0.3); }
+.sess-gantt-main { background: var(--text-dim) !important; opacity: 0.35 !important; }
+.sess-gantt-bar-incomplete { background-image: repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(255,255,255,0.25) 3px, rgba(255,255,255,0.25) 6px); }
+.sess-gantt-grid { position: absolute; inset: 0; pointer-events: none; }
+.sess-gantt-tick { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--border); opacity: 0.4; }
+.sess-gantt-axis { min-height: 18px; margin-bottom: 2px; }
+.sess-gantt-axis-track { height: 14px !important; background: transparent !important; }
+.sess-gantt-axis-label { position: absolute; top: 0; font-size: 10px; color: var(--text-dim); transform: translateX(-50%); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.sess-gantt-caption { position: absolute; top: 2px; height: 12px; line-height: 12px; font-size: 10px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 6px; pointer-events: none; }
+.sess-gantt-caption-inside { color: #fff; padding-left: 6px; }
+
+
 /* --- Agent hierarchy tree --- */
 .sess-agent-tree { padding: 4px 0; }
 .sess-agent-node { padding: 3px 0; }

@@ -1,6 +1,6 @@
 MAKEFILE_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
 
-.PHONY: build build-linux build-windows vet lint lint-js test clean run dev
+.PHONY: build build-linux build-windows vet lint lint-js test check install-hooks clean run dev
 
 build:
 	mkdir -p $(MAKEFILE_DIR)/server/bin
@@ -25,6 +25,16 @@ lint-js:
 
 test:
 	cd server && go test -race -count=1 ./...
+
+# Run all checks CI runs (vet, lint, test, lint-js). Used by the pre-push hook.
+check: vet lint test lint-js
+
+# Install the repo's git hooks so pre-push runs the same checks CI runs.
+install-hooks:
+	git config core.hooksPath .githooks
+	chmod +x .githooks/pre-push 2>/dev/null || true
+	@echo "git hooks installed (core.hooksPath=.githooks)"
+	@echo "bypass once with: GIT_PUSH_SKIP_HOOKS=1 git push"
 
 clean:
 	rm -f server/bin/tma1-server server/bin/tma1-server.exe

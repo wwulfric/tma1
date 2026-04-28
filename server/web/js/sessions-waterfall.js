@@ -117,11 +117,20 @@ function sess_renderWaterfall(timeline, stats) {
     }
 
     // 2. Build flat span list.
+    // Map sub-agent id → task description from stats.agentSpans (populated by sessions-stats.js).
+    var taskDescById = {};
+    if (stats.agentSpans) {
+      for (var tsi = 0; tsi < stats.agentSpans.length; tsi++) {
+        var ssp = stats.agentSpans[tsi];
+        taskDescById[ssp.agent_id] = ssp.task_description || ssp.task_name || '';
+      }
+    }
     spans = [];
     var agentIds = Object.keys(agentSpans);
     for (var si = 0; si < agentIds.length; si++) {
       var ag = agentSpans[agentIds[si]];
-      spans.push({ id: ag.id, parentId: 'root', name: ag.type, spanType: 'agent', start_ts: ag.start_ts, end_ts: ag.end_ts, data: ag });
+      var agName = ag.type + (taskDescById[ag.id] ? ' · ' + taskDescById[ag.id] : '');
+      spans.push({ id: ag.id, parentId: 'root', name: agName, spanType: 'agent', start_ts: ag.start_ts, end_ts: ag.end_ts, data: ag });
     }
 
     for (var ti = 0; ti < timeline.length; ti++) {

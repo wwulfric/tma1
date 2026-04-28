@@ -3,11 +3,11 @@
 
 var AgentCanvas = (function () {
   // ── Constants ────────────────────────────────────────────────
-  var MAIN_R = 28, SUB_R = 20;
-  var DAMPING = 0.92, CENTER_K = 0.005, CHARGE_K = 800;
+  var MAIN_R = 40, SUB_R = 32;
+  var DAMPING = 0.92, CENTER_K = 0.004, CHARGE_K = 3500;
   var PARTICLE_SPEED = 1.2;
   var BUBBLE_TTL = 4.0, MAX_BUBBLES = 4;
-  var TOOL_W = 140, TOOL_H = 30;
+  var TOOL_W = 180, TOOL_H = 42;
   var GRID_SPACING = 30;
   var BG_COLOR = '#050510';
 
@@ -48,6 +48,37 @@ var AgentCanvas = (function () {
   var agentToolCounts = {};
 
   // ── Scene Graph ──────────────────────────────────────────────
+
+  function toolArgHint(toolName, toolInput) {
+    if (!toolInput) return '';
+    var obj = toolInput;
+    if (typeof toolInput === 'string') {
+      try { obj = JSON.parse(toolInput); } catch (e) { return String(toolInput).slice(0, 40); }
+    }
+    if (!obj || typeof obj !== 'object') return '';
+    var hint = '';
+    if (obj.path) hint = obj.path;
+    else if (obj.file_path) hint = obj.file_path;
+    else if (obj.pattern) hint = obj.pattern;
+    else if (obj.query) hint = obj.query;
+    else if (obj.command) hint = obj.command;
+    else if (obj.description) hint = obj.description;
+    else if (obj.url) hint = obj.url;
+    else if (obj.prompt) hint = obj.prompt;
+    else if (obj.sql) hint = obj.sql;
+    else {
+      // Fallback: first string value.
+      for (var k in obj) { if (typeof obj[k] === 'string') { hint = obj[k]; break; } }
+    }
+    hint = String(hint || '').replace(/\s+/g, ' ');
+    // Shorten long paths: keep last 2 segments.
+    if (/[\\/]/.test(hint) && hint.length > 28) {
+      var parts = hint.split(/[\\/]+/);
+      if (parts.length > 2) hint = '…/' + parts.slice(-2).join('/');
+    }
+    if (hint.length > 28) hint = hint.slice(0, 27) + '\u2026';
+    return hint;
+  }
 
   function addAgent(id, label, isMain) {
     if (agents[id]) return agents[id];
@@ -122,7 +153,7 @@ var AgentCanvas = (function () {
       if (!from || !to) continue;
       dx = to.x - from.x; dy = to.y - from.y;
       dist = Math.sqrt(dx * dx + dy * dy) || 1;
-      diff = (dist - (from.r + to.r) * 3) * 0.01;
+      diff = (dist - (from.r + to.r) * 4.5) * 0.01;
       nx = dx / dist; ny = dy / dist;
       if (!from.pinned) { from.vx += nx * diff; from.vy += ny * diff; }
       if (!to.pinned) { to.vx -= nx * diff; to.vy -= ny * diff; }
@@ -302,7 +333,7 @@ var AgentCanvas = (function () {
       // Label with shadow.
       ctx.save();
       ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 4;
-      ctx.fillStyle = '#e6edf3'; ctx.font = (a.r > 22 ? 'bold 11' : '9') + 'px system-ui,sans-serif';
+      ctx.fillStyle = '#e6edf3'; ctx.font = (a.isMain ? 'bold 13' : 'bold 11') + 'px system-ui,sans-serif';
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
       ctx.fillText(a.label, a.x, a.y);
       ctx.restore();
@@ -332,10 +363,22 @@ var AgentCanvas = (function () {
       // Error shake.
       var shakeX = tc.state === 'error' ? Math.sin(globalTime * 30) * 2 : 0;
 
-      ctx.fillStyle = '#e6edf3'; ctx.font = '10px system-ui,sans-serif';
-      ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-      var displayName = tc.toolName.length > 18 ? tc.toolName.slice(0, 17) + '\u2026' : tc.toolName;
-      ctx.fillText(displayName, tx + 10 + shakeX, ty + TOOL_H / 2);
+      ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 11px system-ui,sans-serif';
+      ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+      var displayName = tc.toolName.length > 20 ? tc.toolName.slice(0, 19) + '\u2026' : tc.toolName;
+      ctx.fillText(displayName, tx + 10 + shakeX, ty + 6);
+
+      // Arg hint line (path, pattern, command preview, etc.).
+      if (tc.argHintToolName !== tc.toolName || tc.argHintToolInput !== tc.toolInput) {
+        tc.argHint = toolArgHint(tc.toolName, tc.toolInput);
+        tc.argHintToolName = tc.toolName;
+        tc.argHintToolInput = tc.toolInput;
+      }
+      var hint = tc.argHint;
+      if (hint) {
+        ctx.fillStyle = '#8b949e'; ctx.font = '9px system-ui,sans-serif';
+        ctx.fillText(hint, tx + 10 + shakeX, ty + 23);
+      }
 
       // Spinning ring.
       if (tc.state === 'running') {
@@ -546,6 +589,10 @@ var AgentCanvas = (function () {
       var subId = ev.agent_id || ('sub_' + Date.now());
       var subLabel = ev.agent_type || 'subagent';
       var subNode = addAgent(subId, subLabel, false);
+      // If agent was pre-created by an earlier tool event (which only carried
+      // agent_id, not agent_type), its label is a truncated id — upgrade it
+      // now that we know the real agent_type.
+      if (ev.agent_type) subNode.label = subLabel;
       subNode.agentType = ev.agent_type || '';
       subNode.startTs = ev.ts || Date.now();
       var ek = addEdge(mainId, subId);

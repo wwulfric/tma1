@@ -189,10 +189,25 @@ make vet             # Run go vet
 make lint            # Run golangci-lint (requires golangci-lint v2)
 make lint-js         # Run ESLint on dashboard JS (requires Node.js)
 make test            # Run tests with race detector
+make check           # Run all CI checks locally (vet + lint + test + lint-js)
+make install-hooks   # Install git pre-push hook that runs `make check`
 make clean           # Remove built binaries
 make run             # Build and run locally
 make dev             # Watch mode: rebuild + restart on file changes (requires fswatch)
 ```
+
+### Pre-push hook
+
+Run CI's checks locally before every push:
+
+```bash
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
+make install-hooks
+```
+
+This sets `core.hooksPath=.githooks`. On push, `.githooks/pre-push` runs `go vet`,
+`golangci-lint`, `go test`, and `eslint` (if `server/web/node_modules` exists).
+Bypass once with `GIT_PUSH_SKIP_HOOKS=1 git push`.
 
 ## License
 

@@ -1,6 +1,13 @@
 /* Sessions — stats computation, file path extraction, pricing helpers. */
 /* globals: extractAllFilePaths, sess_lookupPrice, fmtTokens, sess_parseAttrs, tsToMs */
 
+// Safely parse a hook_events.metadata JSON blob. Returns {} on any failure.
+function sess_parseMeta(s) {
+  if (!s) return {};
+  try { var o = JSON.parse(s); return (o && typeof o === 'object') ? o : {}; }
+  catch (e) { return {}; }
+}
+
 // ── Compute Stats ─────────────────────────────────────────────────────
 
 function sess_computeStats(hookEvents, messages, timeline, apiCalls, apiErrors) {
@@ -49,17 +56,90 @@ function sess_computeStats(hookEvents, messages, timeline, apiCalls, apiErrors) 
     }
   }
 
-  // Agent hierarchy.
+  // Agent hierarchy + subagent Gantt spans.
   var agentToolCounts = {};
+  var openById = {};          // agent_id → open span
+  var agentSpans = [];        // paired Start/Stop spans for Gantt
+  var taskDescriptionById = {};   // tool_use_id → { description, prompt } from Task tool_input
+  var sessionStartTs = Infinity, sessionEndTs = 0;
   for (var h = 0; h < hookEvents.length; h++) {
     var hev = hookEvents[h];
-    if (hev.event_type === 'SubagentStart') stats.agents.push(hev);
+    var hts = tsToMs(hev.ts);
+    if (hts < sessionStartTs) sessionStartTs = hts;
+    if (hts > sessionEndTs) sessionEndTs = hts;
+    if (hev.event_type === 'PreToolUse' && hev.tool_name &&
+        (hev.tool_name.toLowerCase() === 'task' || hev.tool_name === 'Task') && hev.tool_use_id) {
+      var ti = sess_parseMeta(hev.tool_input);
+      taskDescriptionById[hev.tool_use_id] = {
+        description: ti.description || '',
+        prompt: ti.prompt || '',
+        name: ti.name || '',
+      };
+    }
+    if (hev.event_type === 'SubagentStart') {
+      stats.agents.push(hev);
+      // If a span is already open for this id, close it out at this ts (anomaly).
+      if (openById[hev.agent_id]) {
+        var prev = openById[hev.agent_id];
+        prev.end_ts = hts;
+        prev.incomplete = true;
+        agentSpans.push(prev);
+      }
+      var meta = sess_parseMeta(hev.metadata);
+      openById[hev.agent_id] = {
+        agent_id: hev.agent_id || '',
+        agent_type: hev.agent_type || 'subagent',
+        start_ts: hts,
+        end_ts: 0,
+        description: meta.description || '',
+        model: '',
+        duration_ms: 0,
+        total_tokens: 0,
+        total_tool_calls: 0,
+        incomplete: false,
+      };
+    } else if (hev.event_type === 'SubagentStop') {
+      var sp = openById[hev.agent_id];
+      if (sp) {
+        var sm = sess_parseMeta(hev.metadata);
+        sp.end_ts = hts;
+        sp.model = sm.model || '';
+        sp.duration_ms = Number(sm.duration_ms) || (hts - sp.start_ts);
+        sp.total_tokens = Number(sm.total_tokens) || 0;
+        sp.total_tool_calls = Number(sm.total_tool_calls) || 0;
+        agentSpans.push(sp);
+        delete openById[hev.agent_id];
+      }
+      // Orphan Stop (no matching Start) — ignore.
+    }
     if (hev.event_type === 'PreToolUse') {
       var aid = hev.agent_id || '';
       agentToolCounts[aid] = (agentToolCounts[aid] || 0) + 1;
     }
   }
+  // Flush still-open spans (missing SubagentStop) — cap at sessionEnd, mark incomplete.
+  var openIds = Object.keys(openById);
+  for (var oi = 0; oi < openIds.length; oi++) {
+    var op = openById[openIds[oi]];
+    op.end_ts = sessionEndTs || op.start_ts;
+    op.duration_ms = op.end_ts - op.start_ts;
+    op.incomplete = true;
+    agentSpans.push(op);
+  }
+  agentSpans.sort(function(a, b) { return a.start_ts - b.start_ts; });
+  // Attach Task tool_input description/prompt to each span (keyed by agent_id = tool_use_id).
+  for (var ax = 0; ax < agentSpans.length; ax++) {
+    var td = taskDescriptionById[agentSpans[ax].agent_id];
+    if (td) {
+      agentSpans[ax].task_description = td.description;
+      agentSpans[ax].task_prompt = td.prompt;
+      agentSpans[ax].task_name = td.name;
+    }
+  }
   stats.agentToolCounts = agentToolCounts;
+  stats.agentSpans = agentSpans;
+  stats.sessionStart = sessionStartTs === Infinity ? 0 : sessionStartTs;
+  stats.sessionEnd = sessionEndTs || stats.sessionStart;
 
   // Messages → context breakdown + model + cost estimate.
   var estInputTokens = 0;

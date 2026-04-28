@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the same checks CI runs before allowing a push.
+# Install once with `make install-hooks` (or: `git config core.hooksPath .githooks`).
+set -e
+
+# Allow bypass with GIT_PUSH_SKIP_HOOKS=1 git push (for emergencies).
+if [ "${GIT_PUSH_SKIP_HOOKS:-0}" = "1" ]; then
+  echo "pre-push: GIT_PUSH_SKIP_HOOKS=1, skipping checks"
+  exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+say() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
+fail() { printf '\n\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+
+# --- Go ---
+say "go vet"
+( cd server && go vet ./... ) || fail "go vet failed"
+
+say "golangci-lint"
+if ! command -v golangci-lint >/dev/null 2>&1; then
+  fail "golangci-lint not installed.
+    Install with:
+      go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.3
+    Or bypass once with: GIT_PUSH_SKIP_HOOKS=1 git push"
+fi
+( cd server && golangci-lint run ./... ) || fail "golangci-lint failed"
+
+say "go test"
+# NOTE: CI runs with -race (requires CGO). Locally we run without -race so the
+# hook works on Windows without a C compiler. CI will still catch race issues.
+( cd server && go test -count=1 ./... ) || fail "go tests failed"
+
+# --- JS ---
+if [ -d server/web/node_modules ]; then
+  say "eslint"
+  ( cd server/web && npx --no-install eslint js/ ) || fail "eslint failed"
+else
+  printf '\n\033[1;33m! skipping eslint: server/web/node_modules missing (run `cd server/web && npm install`)\033[0m\n'
+fi
+
+printf '\n\033[1;32m✓ all pre-push checks passed\033[0m\n'

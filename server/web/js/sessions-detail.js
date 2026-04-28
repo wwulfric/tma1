@@ -2,7 +2,7 @@
 /* globals: t, escapeHTML, escapeJSString, fmtCost, fmtDurSec, fmtTokens, tsToMs, sess_parseAttrs,
    sessExpandedId, sessTimelineData, sessTargetTs, sessApiCallFP,
    sess_renderContextBar, sess_renderWaterfall, sess_renderAPICalls, sess_renderFileHeatmap,
-   sess_renderAgentTree, sess_renderTraceInsights, sess_initWaterfallClicks,
+   sess_renderAgentTree, sess_renderSubagentGantt, sess_renderTraceInsights, sess_initWaterfallClicks,
    renderTimelineItem, sess_filterByTool, sess_filterTimeline, AgentCanvas */
 
 // ── Render Session Detail (two-column overlay) ────────────────────────
@@ -86,7 +86,11 @@ function renderSessionDetail(timeline, stats) {
   html += sess_renderWaterfall(timeline, stats);
   if (stats.apiCalls.length > 0) html += sess_renderAPICalls(stats);
   html += sess_renderFileHeatmap(stats.files);
-  if (stats.agents.length > 0) html += sess_renderAgentTree(stats.agents, stats.agentToolCounts || {});
+  if (stats.agentSpans && stats.agentSpans.length > 0) {
+    html += sess_renderSubagentGantt(stats.agentSpans, stats.sessionStart, stats.sessionEnd, stats.agentToolCounts || {});
+  } else if (stats.agents.length > 0) {
+    html += sess_renderAgentTree(stats.agents, stats.agentToolCounts || {});
+  }
   if (stats.ccTraceSpans && stats.ccTraceSpans.length > 0) html += sess_renderTraceInsights(stats.ccTraceSpans);
   html += '</div>';
 

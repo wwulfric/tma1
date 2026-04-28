@@ -3,9 +3,11 @@ package transcript
 import (
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProcessCopilotCLILineSessionStart(t *testing.T) {
@@ -277,6 +279,86 @@ func TestProcessCopilotCLILineDedup(t *testing.T) {
 		t.Fatalf("expected dedup to prevent second insert, but got: %s", sql)
 	default:
 		// OK — no second insert.
+	}
+}
+
+func TestFetchCopilotCLIMaxTsParsesTimestampString(t *testing.T) {
+	const maxTS = "2026-04-16T01:00:00Z"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(500)
+			return
+		}
+		sql := r.Form.Get("sql")
+		if !strings.Contains(sql, "SELECT MAX(ts)") || !strings.Contains(sql, "cp:abc-123") {
+			t.Fatalf("unexpected SQL: %s", sql)
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"output":[{"records":{"rows":[["` + maxTS + `"]]}}]}`))
+	}))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	want := time.Date(2026, 4, 16, 1, 0, 0, 0, time.UTC).UnixMilli()
+	if got := w.fetchCopilotCLIMaxTs("abc-123"); got != want {
+		t.Fatalf("fetchCopilotCLIMaxTs() = %d, want %d", got, want)
+	}
+}
+
+func TestProcessCopilotCLILineSkipsPersistedEventsFromDBThreshold(t *testing.T) {
+	sqlCh := make(chan string, 4)
+	const maxTS = "2026-04-16T01:00:00Z"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(500)
+			return
+		}
+		sql := r.Form.Get("sql")
+		if strings.Contains(sql, "SELECT MAX(ts)") {
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"output":[{"records":{"rows":[["` + maxTS + `"]]}}]}`))
+			return
+		}
+		sqlCh <- sql
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"output":[]}`))
+	}))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seen := make(map[string]struct{})
+	fctx := &copilotCLIContext{sessionID: "abc-123"}
+	fctx.skipUntilTsMs = w.fetchCopilotCLIMaxTs("abc-123")
+	fctx.lastTsMs = fctx.skipUntilTsMs
+
+	w.processCopilotCLILine("abc-123", `{"type":"user.message","data":{"content":"old"},"id":"evt-old","timestamp":"2026-04-16T00:59:59Z","parentId":null}`, seen, fctx)
+	w.processCopilotCLILine("abc-123", `{"type":"user.message","data":{"content":"equal"},"id":"evt-equal","timestamp":"2026-04-16T01:00:00Z","parentId":null}`, seen, fctx)
+	select {
+	case sql := <-sqlCh:
+		t.Fatalf("expected persisted events to be skipped, but got SQL: %s", sql)
+	default:
+		// OK — no insert for events at/before the DB threshold.
+	}
+
+	w.processCopilotCLILine("abc-123", `{"type":"user.message","data":{"content":"new"},"id":"evt-new","timestamp":"2026-04-16T01:00:01Z","parentId":null}`, seen, fctx)
+	sql := waitForSQL(t, sqlCh)
+	if !strings.Contains(sql, "new") {
+		t.Fatalf("expected post-threshold event to insert, got: %s", sql)
 	}
 }
 

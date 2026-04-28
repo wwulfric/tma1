@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -155,18 +156,18 @@ func (w *Watcher) scanCopilotCLISessionsWithAge(baseDir string, activeAge time.D
 		if alreadyWatching {
 			continue
 		}
-		// Skip sessions already fully ingested into the DB from a previous run.
-		// Trade-off: if Copilot CLI continued writing to this file while the server
-		// was down, those tail events will be missed. Acceptable for now — the
-		// alternative is persisting per-file offsets.
-		if copilotCLIDirIngested(c.id) {
+		isActive := now.Sub(c.mod) < copilotCLIActiveAge
+		// Skip sessions already fully ingested into the DB from a previous run
+		// UNLESS the file has been recently modified — in which case the CLI
+		// may still be writing events we haven't captured yet (watcher timed
+		// out on idle but user resumed activity). The preserved per-session
+		// `seen` map in w.sessions ensures we don't double-insert.
+		if !isActive && copilotCLIDirIngested(c.id) {
 			continue
 		}
 		if activeCount+newWatchers >= maxConcurrentWatchers {
 			break // defer remaining to next scan cycle
 		}
-		// Old completed sessions stop immediately after backfill (no idle wait).
-		isActive := now.Sub(c.mod) < copilotCLIActiveAge
 		markCopilotCLIDirIngested(c.id)
 		w.watchCopilotCLIWithActive(watcherKey, c.id, c.path, isActive)
 		newWatchers++
@@ -237,6 +238,99 @@ func (w *Watcher) loadCopilotCLIIngestedDirs() {
 	w.logger.Info("copilot-cli: loaded previously-ingested sessions", "count", len(copilotCLIIngestedDirs))
 }
 
+// fetchCopilotCLIMaxTs returns the max ts (ms) of events already persisted
+// for the given session, or 0 if none. Used to seed re-watch dedup so a
+// session that was partially ingested before server restart can resume
+// without double-inserting historical events.
+func (w *Watcher) fetchCopilotCLIMaxTs(sessionID string) int64 {
+	form := url.Values{}
+	dbSid := copilotCLISessionPrefix + sessionID
+	form.Set("sql", "SELECT MAX(ts) FROM tma1_hook_events WHERE session_id = '"+strings.ReplaceAll(dbSid, "'", "''")+"'")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := newPostRequest(ctx, w.sqlURL, form)
+	if err != nil {
+		return 0
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != 200 {
+		return 0
+	}
+	var output struct {
+		Output []struct {
+			Records struct {
+				Rows [][]json.RawMessage `json:"rows"`
+			} `json:"records"`
+		} `json:"output"`
+	}
+	if json.Unmarshal(body, &output) != nil {
+		return 0
+	}
+	if len(output.Output) == 0 || len(output.Output[0].Records.Rows) == 0 || len(output.Output[0].Records.Rows[0]) == 0 {
+		return 0
+	}
+	raw := output.Output[0].Records.Rows[0][0]
+	if string(raw) == "null" {
+		return 0
+	}
+	if ms, ok := parseSQLTimestampMs(raw); ok {
+		return ms
+	}
+	w.logger.Debug("copilot-cli: failed to parse max ts", "session", dbSid, "raw", string(raw))
+	return 0
+}
+
+func parseSQLTimestampMs(raw json.RawMessage) (int64, bool) {
+	var n float64
+	if json.Unmarshal(raw, &n) == nil {
+		return normalizeUnixTimestampMs(n), true
+	}
+
+	var s string
+	if json.Unmarshal(raw, &s) != nil {
+		return 0, false
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, false
+	}
+	if n, err := strconv.ParseFloat(s, 64); err == nil {
+		return normalizeUnixTimestampMs(n), true
+	}
+
+	layouts := []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05.999",
+		"2006-01-02 15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.ParseInLocation(layout, s, time.UTC); err == nil {
+			return t.UnixMilli(), true
+		}
+	}
+	return 0, false
+}
+
+func normalizeUnixTimestampMs(v float64) int64 {
+	switch {
+	case v > 1e18:
+		return int64(v / 1e6) // nanoseconds
+	case v > 1e15:
+		return int64(v / 1e3) // microseconds
+	case v > 1e12:
+		return int64(v) // milliseconds
+	default:
+		return int64(v * 1000) // seconds
+	}
+}
+
 func (w *Watcher) watchCopilotCLIWithActive(watcherKey, sessionID, filePath string, isActive bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -289,6 +383,9 @@ func (w *Watcher) tailCopilotCLIFile(ctx context.Context, watcherKey, sessionID,
 	defer f.Close()
 
 	fctx := &copilotCLIContext{sessionID: sessionID}
+	// Seed re-watch dedup threshold from DB: skip events we've already persisted.
+	fctx.skipUntilTsMs = w.fetchCopilotCLIMaxTs(sessionID)
+	fctx.lastTsMs = fctx.skipUntilTsMs
 
 	reader := bufio.NewReader(f)
 	var buf strings.Builder
@@ -343,15 +440,21 @@ type copilotCLIEvent struct {
 	ID        string          `json:"id"`
 	Timestamp string          `json:"timestamp"`
 	ParentID  *string         `json:"parentId"`
+	// AgentID is populated on events emitted inside a sub-agent's context
+	// (e.g. tool.execution_start/complete, assistant.message). Its value
+	// equals the toolCallId of the enclosing subagent.started event.
+	// Empty/absent for events emitted by the main agent.
+	AgentID string `json:"agentId"`
 }
 
 // copilotCLIContext tracks per-file state during parsing.
 type copilotCLIContext struct {
-	sessionID string
-	model     string // current model (updated by session.start and session.model_change)
-	cwd       string
-	live      bool  // true after initial backfill completes
-	lastTsMs  int64 // per-session monotonic timestamp (avoids global lastInsertTS collision)
+	sessionID     string
+	model         string // current model (updated by session.start and session.model_change)
+	cwd           string
+	live          bool  // true after initial backfill completes
+	lastTsMs      int64 // per-session monotonic timestamp (avoids global lastInsertTS collision)
+	skipUntilTsMs int64 // events with raw ts <= this are skipped (re-watch dedup after server restart)
 }
 
 // parseCopilotCLITimestamp handles both RFC3339 and Copilot CLI's MM/DD/YYYY HH:mm:ss format.
@@ -414,6 +517,14 @@ func (w *Watcher) processCopilotCLILine(sessionID, line string, seen map[string]
 	ts := parseCopilotCLITimestamp(ev.Timestamp)
 	if ts.IsZero() {
 		ts = time.Now()
+	}
+
+	// Re-watch dedup: skip events already persisted in a previous run.
+	// skipUntilTsMs is seeded from DB at watcher start; events with raw
+	// timestamp <= that are drops (their IDs are recorded in `seen` above
+	// so subsequent lookups still work for cross-event references).
+	if fctx.skipUntilTsMs > 0 && ts.UnixMilli() <= fctx.skipUntilTsMs {
+		return
 	}
 
 	// Intentionally unhandled event types: hook.start, hook.end, session.warning,
@@ -550,9 +661,9 @@ func (w *Watcher) handleCopilotCLIToolStart(ts time.Time, ev copilotCLIEvent, fc
 	}
 
 	argsStr := truncate(string(data.Arguments), maxToolInput)
-	w.insertCopilotCLIHookEvent(ts, fctx, "PreToolUse", data.ToolName, argsStr, data.ToolCallID, "", nil)
+	w.insertCopilotCLIHookEventFull(ts, fctx, "PreToolUse", data.ToolName, argsStr, data.ToolCallID, "", ev.AgentID, "", nil, "")
 	if fctx.live {
-		w.broadcastHookEvent(fctx.dbSessionID(), "PreToolUse", data.ToolName, argsStr, data.ToolCallID, "", "", "")
+		w.broadcastHookEvent(fctx.dbSessionID(), "PreToolUse", data.ToolName, argsStr, data.ToolCallID, "", ev.AgentID, "")
 	}
 }
 
@@ -580,9 +691,9 @@ func (w *Watcher) handleCopilotCLIToolComplete(ts time.Time, ev copilotCLIEvent,
 	}
 
 	resultStr := truncate(data.Result.Content, maxToolContent)
-	w.insertCopilotCLIHookEvent(ts, fctx, eventType, "", "", data.ToolCallID, resultStr, nil)
+	w.insertCopilotCLIHookEventFull(ts, fctx, eventType, "", "", data.ToolCallID, resultStr, ev.AgentID, "", nil, "")
 	if fctx.live {
-		w.broadcastHookEvent(fctx.dbSessionID(), eventType, "", "", data.ToolCallID, resultStr, "", "")
+		w.broadcastHookEvent(fctx.dbSessionID(), eventType, "", "", data.ToolCallID, resultStr, ev.AgentID, "")
 	}
 }
 
