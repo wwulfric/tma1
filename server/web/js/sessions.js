@@ -245,7 +245,7 @@ async function sess_loadDetail(sessionId, agentSource) {
     ).catch(function() { return null; }),
     query(
       "SELECT ts, session_id, message_type, tool_name, tool_use_id, content, model, " +
-      "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, duration_ms " +
+      "input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, reasoning_tokens, duration_ms " +
       "FROM tma1_messages WHERE session_id = '" + sid + "' ORDER BY ts ASC LIMIT 50000"
     ).catch(function() { return null; }),
   ]);
@@ -253,6 +253,9 @@ async function sess_loadDetail(sessionId, agentSource) {
 
   var hookEvents = phase1[0] ? rowsToObjects(phase1[0]) : [];
   var messages = phase1[1] ? rowsToObjects(phase1[1]) : [];
+  if (agentSource === 'codex') messages = sess_normalizeCodexTranscriptMessages(messages);
+  hookEvents = sess_dedupHookEvents(hookEvents);
+  messages = sess_dedupMessages(messages);
 
   // Infer agent source from hook data when not provided (e.g. search results).
   if (!agentSource && hookEvents.length > 0) {
@@ -302,6 +305,7 @@ async function sess_loadDetail(sessionId, agentSource) {
   // Messages: skip tool_use/tool_result if already covered by a hook-based tool pair.
   for (var mi = 0; mi < messages.length; mi++) {
     var msg = messages[mi];
+    if (msg.message_type === 'llm') continue;
     if ((msg.message_type === 'tool_use' || msg.message_type === 'tool_result') && msg.tool_use_id && pairedIds[msg.tool_use_id]) continue;
     timeline.push({ ts: tsToMs(msg.ts), source: 'message', data: msg });
   }
@@ -315,9 +319,27 @@ async function sess_loadDetail(sessionId, agentSource) {
   var apiErrors = [];
 
   if (agentSource === 'codex') {
-    // Codex: query OTel logs by conversation_id.
+    // Codex: prefer imported rollout-trace inference calls; fallback to OTel logs by conversation_id.
+    for (var li = 0; li < messages.length; li++) {
+      var lm = messages[li];
+      if (lm.message_type !== 'llm') continue;
+      var lIn = Number(lm.input_tokens) || 0;
+      var lOut = Number(lm.output_tokens) || 0;
+      var lCache = Number(lm.cache_read_tokens) || 0;
+      var lReasoning = Number(lm.reasoning_tokens) || 0;
+      if (lIn === 0 && lOut === 0 && lReasoning === 0) continue;
+      var lPrice = sess_lookupPrice(lm.model);
+      apiCalls.push({
+        ts: tsToMs(lm.ts), model: lm.model || '',
+        inputTokens: lIn, outputTokens: lOut,
+        cacheTokens: lCache, cacheCreationTokens: 0,
+        reasoningTokens: lReasoning,
+        cost: lIn * lPrice.input / 1000000 + (lOut + lReasoning) * lPrice.output / 1000000,
+        durationMs: Number(lm.duration_ms) || 0, toolUseIds: [],
+      });
+    }
     var conversationIds = sess_collectConversationIds(hookEvents);
-    if (conversationIds.length > 0 && timeline.length > 0) {
+    if (apiCalls.length === 0 && conversationIds.length > 0 && timeline.length > 0) {
       var tsBetween = "timestamp BETWEEN '" + new Date(timeline[0].ts - 60000).toISOString() + "' AND '" + new Date(timeline[timeline.length - 1].ts + 60000).toISOString() + "'";
       var otelRes = await query(
         "SELECT timestamp, log_attributes FROM opentelemetry_logs " +
@@ -434,6 +456,66 @@ async function sess_loadDetail(sessionId, agentSource) {
   sessCurrentStats.ccTraceSpans = ccTraceSpans;
 
   renderSessionDetail(timeline, sessCurrentStats);
+}
+
+function sess_dedupHookEvents(events) {
+  var seen = {};
+  var out = [];
+  for (var i = 0; i < events.length; i++) {
+    var ev = events[i];
+    var key;
+    if (ev.tool_use_id) {
+      key = 'tool:' + ev.event_type + ':' + ev.tool_use_id;
+    } else if (ev.event_type === 'SessionStart') {
+      key = 'session:' + (ev.conversation_id || '') + ':' + (ev.cwd || '') + ':' + (ev.agent_source || '');
+    } else if (ev.event_type === 'SubagentStart' || ev.event_type === 'SubagentStop') {
+      key = 'agent:' + ev.event_type + ':' + (ev.agent_id || '') + ':' + (ev.agent_type || '');
+    } else {
+      key = 'event:' + ev.event_type + ':' + (ev.agent_id || '') + ':' + (ev.tool_name || '') + ':' + String(ev.tool_input || '').slice(0, 200);
+    }
+    if (seen[key]) continue;
+    seen[key] = true;
+    out.push(ev);
+  }
+  return out;
+}
+
+function sess_normalizeCodexTranscriptMessages(messages) {
+  var out = [];
+  for (var i = 0; i < messages.length; i++) {
+    var msg = messages[i];
+    var content = msg.content || '';
+    var m = content.match(/^\[(\d+)\]\s+tool\s+([A-Za-z0-9_.-]+)\s+(call|result):\s*([\s\S]*)$/);
+    if (msg.message_type === 'user' && m) {
+      var normalized = Object.assign({}, msg);
+      normalized.message_type = m[3] === 'call' ? 'tool_evidence' : 'tool_evidence_result';
+      normalized.tool_name = m[2];
+      normalized.tool_use_id = 'transcript-' + m[1];
+      normalized.content = (m[4] || '').trim();
+      out.push(normalized);
+    } else {
+      out.push(msg);
+    }
+  }
+  return out;
+}
+
+function sess_dedupMessages(messages) {
+  var seen = {};
+  var out = [];
+  for (var i = 0; i < messages.length; i++) {
+    var msg = messages[i];
+    var key;
+    if ((msg.message_type === 'tool_use' || msg.message_type === 'tool_result') && msg.tool_use_id) {
+      key = 'tool-msg:' + msg.message_type + ':' + msg.tool_use_id;
+    } else {
+      key = 'msg:' + msg.message_type + ':' + Math.floor(tsToMs(msg.ts) / 5000) + ':' + String(msg.content || '').slice(0, 500);
+    }
+    if (seen[key]) continue;
+    seen[key] = true;
+    out.push(msg);
+  }
+  return out;
 }
 
 // ── Search ─────────────────────────────────────────────────────────────

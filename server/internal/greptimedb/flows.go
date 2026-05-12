@@ -76,6 +76,7 @@ var sessionTableDDLs = []string{
     output_tokens   BIGINT NULL,
     cache_read_tokens      BIGINT NULL,
     cache_creation_tokens  BIGINT NULL,
+    reasoning_tokens       BIGINT NULL,
     duration_ms            BIGINT NULL
 ) WITH ('append_mode'='true')`,
 	`CREATE TABLE IF NOT EXISTS tma1_prompt_insights (
@@ -103,6 +104,7 @@ var sessionTableUpgrades = []string{
 	`ALTER TABLE tma1_messages ADD COLUMN output_tokens BIGINT NULL`,
 	`ALTER TABLE tma1_messages ADD COLUMN cache_read_tokens BIGINT NULL`,
 	`ALTER TABLE tma1_messages ADD COLUMN cache_creation_tokens BIGINT NULL`,
+	`ALTER TABLE tma1_messages ADD COLUMN reasoning_tokens BIGINT NULL`,
 	`ALTER TABLE tma1_messages ADD COLUMN duration_ms BIGINT NULL`,
 }
 

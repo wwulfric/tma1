@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,6 +176,7 @@ func (w *Watcher) tailCodexFile(ctx context.Context, watcherKey, sessionID, file
 	reader := bufio.NewReader(f)
 	var buf strings.Builder
 	fctx := &codexFileContext{fileID: watcherKey} // populated by session_meta event
+	fctx.skipUntilTsMs = w.fetchCodexMaxTs(sessionID)
 	idleCount := 0
 	const maxIdlePolls = 600 // 5 minutes at 500ms interval
 	for {
@@ -228,6 +230,7 @@ type codexResponseItem struct {
 	Name    string          `json:"name"`
 	CallID  string          `json:"call_id"`
 	Content json.RawMessage `json:"content"`
+	Summary json.RawMessage `json:"summary"`
 	Output  string          `json:"output"`
 	Input   string          `json:"input"`
 	// function_call fields
@@ -240,7 +243,10 @@ type codexFileContext struct {
 	agentID        string
 	agentType      string
 	conversationID string // from session_meta.payload.id (= OTel conversation.id)
-	live           bool   // true after initial backfill completes (first EOF)
+	model          string
+	hookSeen       map[string]struct{}
+	skipUntilTsMs  int64 // max DB timestamp from a previous scan; prevents restart replay duplicates
+	live           bool  // true after initial backfill completes (first EOF)
 }
 
 func (w *Watcher) processCodexLine(sessionID, line string, seen map[string]struct{}, fctx *codexFileContext) {
@@ -255,70 +261,82 @@ func (w *Watcher) processCodexLine(sessionID, line string, seen map[string]struc
 		ts = time.Now()
 	}
 
+	if ev.Type == "session_meta" {
+		w.applyCodexSessionMeta(ev.Payload, fctx)
+	}
+	if ev.Type == "turn_context" {
+		w.applyCodexTurnContext(ev.Payload, fctx)
+	}
+	if fctx != nil && fctx.skipUntilTsMs > 0 && ts.UnixMilli() <= fctx.skipUntilTsMs {
+		return
+	}
+
 	switch ev.Type {
 	case "session_meta":
 		// Detect subagent from source field: {"subagent": "review"} vs "cli"
-		var meta struct {
-			ID     string          `json:"id"` // conversation ID (= OTel conversation.id)
-			Source json.RawMessage `json:"source"`
-			CWD    string          `json:"cwd"`
-		}
-		if err := json.Unmarshal(ev.Payload, &meta); err == nil {
-			if meta.ID != "" {
-				fctx.conversationID = meta.ID
-			}
-			var subSource struct {
-				Subagent string `json:"subagent"`
-			}
-			if json.Unmarshal(meta.Source, &subSource) == nil && subSource.Subagent != "" {
-				fctx.agentID = codexSubagentID(fctx.fileID, subSource.Subagent)
-				fctx.agentType = subSource.Subagent
-				w.insertCodexSubagentEvent(sessionID, ts, fctx.agentID, fctx.agentType, fctx.conversationID)
+		meta := parseCodexSessionMeta(ev.Payload)
+		if meta.subagent != "" {
+			if fctx != nil {
+				w.insertCodexSubagentEvent(sessionID, ts, fctx.agentID, fctx.agentType, fctx.conversationID, fctx)
 				if fctx.live {
 					w.broadcastHookEvent(sessionID, "SubagentStart", "", "", "", "", fctx.agentID, fctx.agentType)
 				}
-				break
 			}
+			break
 		}
-		w.insertCodexSessionStart(sessionID, ts, meta.CWD, fctx.conversationID)
-		if fctx.live {
+		conversationID := ""
+		if fctx != nil {
+			conversationID = fctx.conversationID
+		}
+		w.insertCodexSessionStart(sessionID, ts, meta.cwd, conversationID, fctx)
+		if fctx != nil && fctx.live {
 			w.broadcastHookEvent(sessionID, "SessionStart", "", "", "", "", "", "")
 		}
 
 	case "turn_context":
 		// Extract model name and store as a message with model field set.
-		var turnCtx struct {
-			Model string `json:"model"`
-		}
-		if json.Unmarshal(ev.Payload, &turnCtx) == nil && turnCtx.Model != "" {
-			w.insertCodexModelMessage(sessionID, ts, turnCtx.Model, seen)
+		if fctx != nil && fctx.model != "" {
+			w.insertCodexModelMessage(sessionID, ts, fctx.model, seen)
 		}
 
 	case "event_msg":
 		var eventMsg struct {
-			Type    string `json:"type"`
-			Message string `json:"message"`
-			Phase   string `json:"phase"`
+			Type    string          `json:"type"`
+			Message string          `json:"message"`
+			Phase   string          `json:"phase"`
+			TurnID  string          `json:"turn_id"`
+			CallID  string          `json:"call_id"`
+			Query   string          `json:"query"`
+			Action  json.RawMessage `json:"action"`
 		}
 		if err := json.Unmarshal(ev.Payload, &eventMsg); err != nil {
 			return
 		}
 		switch eventMsg.Type {
+		case "task_started":
+			w.insertCodexHookEvent(sessionID, ts, "TaskCreated", "", "", eventMsg.TurnID, "", fctx)
 		case "task_complete":
+			w.insertCodexHookEvent(sessionID, ts, "TaskCompleted", "", "", eventMsg.TurnID, "", fctx)
 			// Emit SubagentStop for subagent files.
-			if fctx.agentID != "" {
+			if fctx != nil && fctx.agentID != "" {
 				w.insertCodexHookEvent(sessionID, ts, "SubagentStop", "", "", "", "", fctx)
 			}
 		case "user_message":
 			msg := strings.TrimSpace(eventMsg.Message)
 			if msg != "" {
-				w.insertCodexMessage(sessionID, ts, "user", msg, seen)
+				w.insertCodexMessage(sessionID, ts, "user", msg, seen, fctx)
 			}
 		case "agent_message":
 			msg := strings.TrimSpace(eventMsg.Message)
 			if msg != "" {
-				w.insertCodexMessage(sessionID, ts, "assistant", msg, seen)
+				w.insertCodexMessage(sessionID, ts, "assistant", msg, seen, fctx)
 			}
+		case "web_search_end":
+			toolInput := codexWebSearchInput(eventMsg.Query, eventMsg.Action)
+			w.insertCodexHookEvent(sessionID, ts, "PreToolUse", "web_search", toolInput, eventMsg.CallID, "", fctx)
+			w.insertCodexTypedMessage(sessionID, ts, "tool_use", "assistant", toolInput, codexModel(fctx), "web_search", eventMsg.CallID, seen)
+			w.insertCodexHookEvent(sessionID, ts, "PostToolUse", "web_search", "", eventMsg.CallID, toolInput, fctx)
+			w.insertCodexTypedMessage(sessionID, ts, "tool_result", "user", toolInput, codexModel(fctx), "web_search", eventMsg.CallID, seen)
 		}
 
 	case "response_item":
@@ -346,28 +364,225 @@ func (w *Watcher) processCodexResponseItem(sessionID string, ts time.Time, item 
 			// Try as single string.
 			var s string
 			if err := json.Unmarshal(item.Content, &s); err == nil && s != "" {
-				w.insertCodexMessage(sessionID, ts, role, s, seen)
+				w.insertCodexMessage(sessionID, ts, role, s, seen, fctx)
 			}
 			return
 		}
 		for _, b := range contentBlocks {
 			if (b.Type == "input_text" || b.Type == "output_text" || b.Type == "text") && b.Text != "" {
-				w.insertCodexMessage(sessionID, ts, role, b.Text, seen)
+				w.insertCodexMessage(sessionID, ts, role, b.Text, seen, fctx)
 			}
+		}
+
+	case "reasoning":
+		if text := extractCodexReasoning(item); text != "" {
+			w.insertCodexTypedMessage(sessionID, ts, "thinking", "assistant", text, codexModel(fctx), "", "", seen)
 		}
 
 	case "function_call":
 		w.insertCodexHookEvent(sessionID, ts, "PreToolUse", item.Name, item.Arguments, item.CallID, "", fctx)
+		w.insertCodexTypedMessage(sessionID, ts, "tool_use", "assistant", item.Arguments, codexModel(fctx), item.Name, item.CallID, seen)
 
 	case "function_call_output":
 		w.insertCodexHookEvent(sessionID, ts, "PostToolUse", "", "", item.CallID, item.Output, fctx)
+		w.insertCodexTypedMessage(sessionID, ts, "tool_result", "user", item.Output, codexModel(fctx), "", item.CallID, seen)
 
 	case "custom_tool_call":
 		w.insertCodexHookEvent(sessionID, ts, "PreToolUse", item.Name, item.Input, item.CallID, "", fctx)
+		w.insertCodexTypedMessage(sessionID, ts, "tool_use", "assistant", item.Input, codexModel(fctx), item.Name, item.CallID, seen)
 
 	case "custom_tool_call_output":
 		w.insertCodexHookEvent(sessionID, ts, "PostToolUse", "", "", item.CallID, item.Output, fctx)
+		w.insertCodexTypedMessage(sessionID, ts, "tool_result", "user", item.Output, codexModel(fctx), "", item.CallID, seen)
 	}
+}
+
+type codexSessionMeta struct {
+	id       string
+	cwd      string
+	subagent string
+}
+
+func parseCodexSessionMeta(raw json.RawMessage) codexSessionMeta {
+	var meta struct {
+		ID     string          `json:"id"`
+		Source json.RawMessage `json:"source"`
+		CWD    string          `json:"cwd"`
+	}
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return codexSessionMeta{}
+	}
+	out := codexSessionMeta{id: meta.ID, cwd: meta.CWD}
+	out.subagent = parseCodexSubagentSource(meta.Source)
+	return out
+}
+
+func parseCodexSubagentSource(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var sourceString string
+	if json.Unmarshal(raw, &sourceString) == nil {
+		return ""
+	}
+	var source struct {
+		Subagent json.RawMessage `json:"subagent"`
+	}
+	if json.Unmarshal(raw, &source) != nil || len(source.Subagent) == 0 || string(source.Subagent) == "null" {
+		return ""
+	}
+	var subagent string
+	if json.Unmarshal(source.Subagent, &subagent) == nil {
+		return strings.TrimSpace(subagent)
+	}
+	var subagentObj map[string]string
+	if json.Unmarshal(source.Subagent, &subagentObj) == nil {
+		if other := strings.TrimSpace(subagentObj["other"]); other != "" {
+			if other == "guardian" {
+				return "codex-auto-review"
+			}
+			return other
+		}
+	}
+	return ""
+}
+
+func (w *Watcher) applyCodexSessionMeta(raw json.RawMessage, fctx *codexFileContext) {
+	if fctx == nil {
+		return
+	}
+	meta := parseCodexSessionMeta(raw)
+	if meta.id != "" {
+		fctx.conversationID = meta.id
+	}
+	if meta.subagent != "" {
+		fctx.agentID = codexSubagentID(fctx.fileID, meta.subagent)
+		fctx.agentType = meta.subagent
+	}
+}
+
+func (w *Watcher) applyCodexTurnContext(raw json.RawMessage, fctx *codexFileContext) {
+	if fctx == nil {
+		return
+	}
+	var turnCtx struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(raw, &turnCtx) == nil && turnCtx.Model != "" {
+		fctx.model = turnCtx.Model
+	}
+}
+
+func extractCodexReasoning(item codexResponseItem) string {
+	if text := extractCodexText(item.Content, "reasoning_text", "text", "output_text"); text != "" {
+		return text
+	}
+	return extractCodexText(item.Summary, "summary_text", "text")
+}
+
+func extractCodexText(raw json.RawMessage, allowedTypes ...string) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	allowed := make(map[string]struct{}, len(allowedTypes))
+	for _, typ := range allowedTypes {
+		allowed[typ] = struct{}{}
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, b := range blocks {
+		if _, ok := allowed[b.Type]; !ok {
+			continue
+		}
+		text := strings.TrimSpace(b.Text)
+		if text == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(text)
+	}
+	return sb.String()
+}
+
+func codexWebSearchInput(query string, action json.RawMessage) string {
+	query = strings.TrimSpace(query)
+	actionText := strings.TrimSpace(string(action))
+	if query == "" {
+		if actionText == "null" {
+			return ""
+		}
+		return actionText
+	}
+	if actionText == "" || actionText == "null" {
+		return query
+	}
+	queryJSON, err := json.Marshal(query)
+	if err != nil {
+		return actionText
+	}
+	return `{"query":` + string(queryJSON) + `,"action":` + actionText + `}`
+}
+
+func codexModel(fctx *codexFileContext) string {
+	if fctx == nil {
+		return ""
+	}
+	return fctx.model
+}
+
+func (fctx *codexFileContext) seenCodexHook(eventType, toolUseID, agentID, agentType, toolName, toolInput, toolResult, conversationID, cwd string) bool {
+	if fctx == nil || fctx.hookSeen == nil {
+		return false
+	}
+	key := codexHookKey(eventType, toolUseID, agentID, agentType, toolName, toolInput, toolResult, conversationID, cwd)
+	if _, ok := fctx.hookSeen[key]; ok {
+		return true
+	}
+	fctx.hookSeen[key] = struct{}{}
+	return false
+}
+
+func codexHookKey(eventType, toolUseID, agentID, agentType, toolName, toolInput, toolResult, conversationID, cwd string) string {
+	if toolUseID != "" {
+		return eventType + ":" + toolUseID
+	}
+	switch eventType {
+	case "SessionStart":
+		return eventType + ":" + conversationID + ":" + cwd
+	case "SubagentStart", "SubagentStop":
+		return eventType + ":" + agentID + ":" + agentType + ":" + conversationID
+	}
+	prefix := toolInput
+	if prefix == "" {
+		prefix = toolResult
+	}
+	if len(prefix) > 200 {
+		prefix = prefix[:200]
+	}
+	return eventType + ":" + agentID + ":" + agentType + ":" + toolName + ":" + prefix
+}
+
+func codexMessageSeenKey(messageType, role, content, toolUseID string) string {
+	prefix := content
+	if len(prefix) > 200 {
+		prefix = prefix[:200]
+	}
+	if toolUseID != "" && (messageType == "tool_use" || messageType == "tool_result" || messageType == "llm") {
+		return messageType + ":" + toolUseID
+	}
+	return messageType + ":" + role + ":" + prefix
 }
 
 // insertCodexModelMessage stores a synthetic message with the model field set.
@@ -408,21 +623,23 @@ func (w *Watcher) insertCodexModelMessage(sessionID string, ts time.Time, model 
 	// Do NOT broadcast model messages — they are synthetic metadata, not hook events.
 }
 
-func (w *Watcher) insertCodexMessage(sessionID string, ts time.Time, role, content string, seen map[string]struct{}) {
-	// Dedup by content prefix hash.
-	prefix := content
-	if len(prefix) > 200 {
-		prefix = prefix[:200]
-	}
-	key := role + ":" + prefix
-	if _, ok := seen[key]; ok {
-		return
-	}
-	seen[key] = struct{}{}
-
+func (w *Watcher) insertCodexMessage(sessionID string, ts time.Time, role, content string, seen map[string]struct{}, fctx *codexFileContext) {
 	msgType := "user"
 	if role == "assistant" {
 		msgType = "assistant"
+	}
+	w.insertCodexTypedMessage(sessionID, ts, msgType, role, content, codexModel(fctx), "", "", seen)
+}
+
+func (w *Watcher) insertCodexTypedMessage(sessionID string, ts time.Time, messageType, role, content, model, toolName, toolUseID string, seen map[string]struct{}) {
+	// Dedup by stable identity. Tool messages use call id; text messages use a
+	// content prefix so Codex context replays do not inflate conversation rows.
+	key := codexMessageSeenKey(messageType, role, content, toolUseID)
+	if seen != nil {
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
 	}
 
 	msTs := ts.UnixMilli()
@@ -440,12 +657,15 @@ func (w *Watcher) insertCodexMessage(sessionID string, ts time.Time, role, conte
 
 	sql := fmt.Sprintf(
 		"INSERT INTO tma1_messages (ts, session_id, message_type, \"role\", content, model, tool_name, tool_use_id) "+
-			"VALUES (%d, '%s', '%s', '%s', '%s', '', '', '')",
+			"VALUES (%d, '%s', '%s', '%s', '%s', '%s', '%s', '%s')",
 		msTs,
 		escapeSQLString(sessionID),
-		escapeSQLString(msgType),
+		escapeSQLString(messageType),
 		escapeSQLString(role),
 		escapeSQLString(truncate(content, maxContentLen)),
+		escapeSQLString(model),
+		escapeSQLString(toolName),
+		escapeSQLString(toolUseID),
 	)
 	go func() {
 		insertSem <- struct{}{}
@@ -454,7 +674,63 @@ func (w *Watcher) insertCodexMessage(sessionID string, ts time.Time, role, conte
 	}()
 }
 
-func (w *Watcher) insertCodexSessionStart(sessionID string, ts time.Time, cwd, conversationID string) {
+// fetchCodexMaxTs returns the newest persisted row for a Codex session across
+// hook events and messages. It seeds per-file replay dedup after server restart.
+func (w *Watcher) fetchCodexMaxTs(sessionID string) int64 {
+	maxHook := w.fetchCodexMaxTsFrom("tma1_hook_events", sessionID)
+	maxMsg := w.fetchCodexMaxTsFrom("tma1_messages", sessionID)
+	if maxMsg > maxHook {
+		return maxMsg
+	}
+	return maxHook
+}
+
+func (w *Watcher) fetchCodexMaxTsFrom(table, sessionID string) int64 {
+	form := url.Values{}
+	form.Set("sql", "SELECT MAX(ts) FROM "+table+" WHERE session_id = '"+escapeSQLString(sessionID)+"'")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := newPostRequest(ctx, w.sqlURL, form)
+	if err != nil {
+		return 0
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != 200 {
+		return 0
+	}
+	var output struct {
+		Output []struct {
+			Records struct {
+				Rows [][]json.RawMessage `json:"rows"`
+			} `json:"records"`
+		} `json:"output"`
+	}
+	if json.Unmarshal(body, &output) != nil {
+		return 0
+	}
+	if len(output.Output) == 0 || len(output.Output[0].Records.Rows) == 0 || len(output.Output[0].Records.Rows[0]) == 0 {
+		return 0
+	}
+	raw := output.Output[0].Records.Rows[0][0]
+	if string(raw) == "null" {
+		return 0
+	}
+	if ms, ok := parseSQLTimestampMs(raw); ok {
+		return ms
+	}
+	w.logger.Debug("codex: failed to parse max ts", "session", sessionID, "table", table, "raw", string(raw))
+	return 0
+}
+
+func (w *Watcher) insertCodexSessionStart(sessionID string, ts time.Time, cwd, conversationID string, fctx *codexFileContext) {
+	if fctx != nil && fctx.seenCodexHook("SessionStart", "", "", "", "", "", "", conversationID, cwd) {
+		return
+	}
 	msTs := ts.UnixMilli()
 	for {
 		prev := lastInsertTS.Load()
@@ -492,7 +768,10 @@ func codexSubagentID(fileID, agentType string) string {
 	return agentType
 }
 
-func (w *Watcher) insertCodexSubagentEvent(sessionID string, ts time.Time, agentID, agentType, conversationID string) {
+func (w *Watcher) insertCodexSubagentEvent(sessionID string, ts time.Time, agentID, agentType, conversationID string, fctx *codexFileContext) {
+	if fctx != nil && fctx.seenCodexHook("SubagentStart", "", agentID, agentType, "", "", "", conversationID, "") {
+		return
+	}
 	msTs := ts.UnixMilli()
 	for {
 		prev := lastInsertTS.Load()
@@ -525,6 +804,21 @@ func (w *Watcher) insertCodexSubagentEvent(sessionID string, ts time.Time, agent
 }
 
 func (w *Watcher) insertCodexHookEvent(sessionID string, ts time.Time, eventType, toolName, toolInput, toolUseID, toolResult string, fctx *codexFileContext) {
+	agentID := ""
+	agentType := ""
+	if fctx != nil {
+		agentID = fctx.agentID
+		agentType = fctx.agentType
+	}
+
+	conversationID := ""
+	if fctx != nil {
+		conversationID = fctx.conversationID
+	}
+	if fctx != nil && fctx.seenCodexHook(eventType, toolUseID, agentID, agentType, toolName, toolInput, toolResult, conversationID, "") {
+		return
+	}
+
 	msTs := ts.UnixMilli()
 	for {
 		prev := lastInsertTS.Load()
@@ -536,18 +830,6 @@ func (w *Watcher) insertCodexHookEvent(sessionID string, ts time.Time, eventType
 			msTs = next
 			break
 		}
-	}
-
-	agentID := ""
-	agentType := ""
-	if fctx != nil {
-		agentID = fctx.agentID
-		agentType = fctx.agentType
-	}
-
-	conversationID := ""
-	if fctx != nil {
-		conversationID = fctx.conversationID
 	}
 
 	sql := fmt.Sprintf(

@@ -227,5 +227,11 @@ function renderMessage(msg, ts) {
     return '<div class="tl-tool-card tl-tool-card-ok"><div class="tl-tool-card-header"><span class="tl-time">' + time + '</span><span class="tl-tool-name">' + escapeHTML(toolLabel) + '</span></div>' + (as ? '<div class="tl-tool-card-args">' + escapeHTML(as) + '</div>' : '') + '</div>';
   }
   if (type === 'tool_result') return '<div class="tl-item tl-tool-result"><span class="tl-time">' + time + '</span> <span class="tl-badge tl-badge-ok">\u2713</span> <span class="tl-result">' + escapeHTML(content.length > 200 ? content.slice(0, 200) + '\u2026' : content) + '</span></div>';
+  if (type === 'tool_evidence' || type === 'tool_evidence_result') {
+    var evidenceLabel = msg.tool_name || 'tool';
+    var evidence = content.length > 300 ? content.slice(0, 300) + '\u2026' : content;
+    return '<div class="tl-item"><span class="tl-time">' + time + '</span> <span class="tl-badge" style="background:rgba(148,163,184,0.14);color:var(--text-dim)">EVIDENCE</span> <strong>' + escapeHTML(evidenceLabel) + '</strong> <span class="tl-result">' + escapeHTML(evidence) + '</span></div>';
+  }
+  if (type === 'system' || type === 'developer') return '<div class="tl-item"><span class="tl-time">' + time + '</span> <span class="tl-role" style="color:var(--text-dim)">' + escapeHTML(type.toUpperCase()) + '</span> <div class="tl-content">' + escapeHTML(content) + '</div></div>';
   return '<div class="tl-item"><span class="tl-time">' + time + '</span> ' + escapeHTML(content) + '</div>';
 }
