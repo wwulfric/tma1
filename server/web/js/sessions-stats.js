@@ -20,6 +20,7 @@ function sess_computeStats(hookEvents, messages, timeline, apiCalls, apiErrors) 
     apiCalls: apiCalls || [],
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    totalReasoningTokens: 0,
     totalCacheTokens: 0,
     cacheHitRatio: 0,
     apiErrors: apiErrors || [],
@@ -179,17 +180,19 @@ function sess_computeStats(hookEvents, messages, timeline, apiCalls, apiErrors) 
   // OTel enrichment: prefer precise data over estimates.
   if (stats.apiCalls.length > 0) {
     stats.hasOTel = true;
-    var totalIn = 0, totalOut = 0, totalCache = 0, totalCost = 0;
+    var totalIn = 0, totalOut = 0, totalReasoning = 0, totalCache = 0, totalCost = 0;
     for (var ac = 0; ac < stats.apiCalls.length; ac++) {
       var call = stats.apiCalls[ac];
       totalIn += call.inputTokens;
       totalOut += call.outputTokens;
+      totalReasoning += call.reasoningTokens || 0;
       totalCache += call.cacheTokens;
       totalCost += call.cost;
       if (!stats.primaryModel && call.model) stats.primaryModel = call.model;
     }
     stats.totalInputTokens = totalIn;
     stats.totalOutputTokens = totalOut;
+    stats.totalReasoningTokens = totalReasoning;
     stats.totalCacheTokens = totalCache;
     stats.cost = totalCost;
     stats.costSource = 'otel';

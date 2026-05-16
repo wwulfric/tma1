@@ -129,24 +129,30 @@ func (w *Watcher) watchCodex(watcherKey, sessionID, filePath string) {
 		return // already watching this file
 	}
 
-	// Reuse existing seen map to avoid re-inserting previously processed lines.
+	// Reuse existing seen maps to avoid re-inserting previously processed lines.
 	var seen map[string]struct{}
 	if ok && existing.seen != nil {
 		seen = existing.seen
 	} else {
 		seen = make(map[string]struct{})
 	}
+	var hookSeen map[string]struct{}
+	if ok && existing.hookSeen != nil {
+		hookSeen = existing.hookSeen
+	} else {
+		hookSeen = make(map[string]struct{})
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	sw := &sessionWatch{cancel: cancel, seen: seen}
+	sw := &sessionWatch{cancel: cancel, seen: seen, hookSeen: hookSeen}
 	w.sessions[watcherKey] = sw
 
-	go w.tailCodexFile(ctx, watcherKey, sessionID, filePath, seen)
+	go w.tailCodexFile(ctx, watcherKey, sessionID, filePath, seen, hookSeen)
 	w.logger.Info("watching codex session", "session", sessionID, "file", filePath)
 }
 
 // tailCodexFile reads a Codex JSONL session file and inserts events into GreptimeDB.
-func (w *Watcher) tailCodexFile(ctx context.Context, watcherKey, sessionID, filePath string, seen map[string]struct{}) {
+func (w *Watcher) tailCodexFile(ctx context.Context, watcherKey, sessionID, filePath string, seen, hookSeen map[string]struct{}) {
 	// Mark as stopped on exit so scanner can restart with preserved seen map.
 	defer func() {
 		w.mu.Lock()
@@ -175,8 +181,8 @@ func (w *Watcher) tailCodexFile(ctx context.Context, watcherKey, sessionID, file
 
 	reader := bufio.NewReader(f)
 	var buf strings.Builder
-	fctx := &codexFileContext{fileID: watcherKey} // populated by session_meta event
-	fctx.skipUntilTsMs = w.fetchCodexMaxTs(sessionID)
+	fctx := newCodexFileContext(watcherKey, hookSeen) // populated by session_meta event
+	w.seedCodexSeenState(sessionID, seen, fctx.hookSeen)
 	idleCount := 0
 	const maxIdlePolls = 600 // 5 minutes at 500ms interval
 	for {
@@ -245,8 +251,14 @@ type codexFileContext struct {
 	conversationID string // from session_meta.payload.id (= OTel conversation.id)
 	model          string
 	hookSeen       map[string]struct{}
-	skipUntilTsMs  int64 // max DB timestamp from a previous scan; prevents restart replay duplicates
-	live           bool  // true after initial backfill completes (first EOF)
+	live           bool // true after initial backfill completes (first EOF)
+}
+
+func newCodexFileContext(fileID string, hookSeen map[string]struct{}) *codexFileContext {
+	if hookSeen == nil {
+		hookSeen = make(map[string]struct{})
+	}
+	return &codexFileContext{fileID: fileID, hookSeen: hookSeen}
 }
 
 func (w *Watcher) processCodexLine(sessionID, line string, seen map[string]struct{}, fctx *codexFileContext) {
@@ -266,9 +278,6 @@ func (w *Watcher) processCodexLine(sessionID, line string, seen map[string]struc
 	}
 	if ev.Type == "turn_context" {
 		w.applyCodexTurnContext(ev.Payload, fctx)
-	}
-	if fctx != nil && fctx.skipUntilTsMs > 0 && ts.UnixMilli() <= fctx.skipUntilTsMs {
-		return
 	}
 
 	switch ev.Type {
@@ -674,34 +683,67 @@ func (w *Watcher) insertCodexTypedMessage(sessionID string, ts time.Time, messag
 	}()
 }
 
-// fetchCodexMaxTs returns the newest persisted row for a Codex session across
-// hook events and messages. It seeds per-file replay dedup after server restart.
-func (w *Watcher) fetchCodexMaxTs(sessionID string) int64 {
-	maxHook := w.fetchCodexMaxTsFrom("tma1_hook_events", sessionID)
-	maxMsg := w.fetchCodexMaxTsFrom("tma1_messages", sessionID)
-	if maxMsg > maxHook {
-		return maxMsg
+func (w *Watcher) seedCodexSeenState(sessionID string, seen, hookSeen map[string]struct{}) {
+	if seen != nil {
+		messageSQL := "SELECT message_type, \"role\", content, model, tool_use_id " +
+			"FROM tma1_messages WHERE session_id = '" + escapeSQLString(sessionID) + "' LIMIT 100000"
+		for _, row := range w.fetchCodexRows(messageSQL, sessionID, "messages") {
+			if len(row) < 5 {
+				continue
+			}
+			messageType := sqlRowString(row[0])
+			role := sqlRowString(row[1])
+			content := sqlRowString(row[2])
+			model := sqlRowString(row[3])
+			toolUseID := sqlRowString(row[4])
+			seen[codexMessageSeenKey(messageType, role, content, toolUseID)] = struct{}{}
+			if messageType == "assistant" && role == "assistant" && content == "" && model != "" {
+				seen["model:"+model] = struct{}{}
+			}
+		}
 	}
-	return maxHook
+	if hookSeen != nil {
+		hookSQL := "SELECT event_type, tool_use_id, agent_id, agent_type, tool_name, tool_input, " +
+			"tool_result, conversation_id, cwd FROM tma1_hook_events WHERE session_id = '" +
+			escapeSQLString(sessionID) + "' AND agent_source = 'codex' LIMIT 100000"
+		for _, row := range w.fetchCodexRows(hookSQL, sessionID, "hooks") {
+			if len(row) < 9 {
+				continue
+			}
+			eventType := sqlRowString(row[0])
+			toolUseID := sqlRowString(row[1])
+			agentID := sqlRowString(row[2])
+			agentType := sqlRowString(row[3])
+			toolName := sqlRowString(row[4])
+			toolInput := sqlRowString(row[5])
+			toolResult := sqlRowString(row[6])
+			conversationID := sqlRowString(row[7])
+			cwd := sqlRowString(row[8])
+			hookSeen[codexHookKey(eventType, toolUseID, agentID, agentType, toolName, toolInput, toolResult, conversationID, cwd)] = struct{}{}
+		}
+	}
 }
 
-func (w *Watcher) fetchCodexMaxTsFrom(table, sessionID string) int64 {
+func (w *Watcher) fetchCodexRows(sql, sessionID, table string) [][]json.RawMessage {
 	form := url.Values{}
-	form.Set("sql", "SELECT MAX(ts) FROM "+table+" WHERE session_id = '"+escapeSQLString(sessionID)+"'")
+	form.Set("sql", sql)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := newPostRequest(ctx, w.sqlURL, form)
 	if err != nil {
-		return 0
+		w.logger.Debug("codex: failed to build seen-state query", "session", sessionID, "table", table, "error", err)
+		return nil
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return 0
+		w.logger.Debug("codex: failed to fetch seen state", "session", sessionID, "table", table, "error", err)
+		return nil
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil || resp.StatusCode != 200 {
-		return 0
+		w.logger.Debug("codex: failed to read seen state", "session", sessionID, "table", table, "status", resp.StatusCode, "error", err)
+		return nil
 	}
 	var output struct {
 		Output []struct {
@@ -711,20 +753,24 @@ func (w *Watcher) fetchCodexMaxTsFrom(table, sessionID string) int64 {
 		} `json:"output"`
 	}
 	if json.Unmarshal(body, &output) != nil {
-		return 0
+		w.logger.Debug("codex: failed to parse seen state", "session", sessionID, "table", table)
+		return nil
 	}
-	if len(output.Output) == 0 || len(output.Output[0].Records.Rows) == 0 || len(output.Output[0].Records.Rows[0]) == 0 {
-		return 0
+	if len(output.Output) == 0 {
+		return nil
 	}
-	raw := output.Output[0].Records.Rows[0][0]
-	if string(raw) == "null" {
-		return 0
+	return output.Output[0].Records.Rows
+}
+
+func sqlRowString(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
 	}
-	if ms, ok := parseSQLTimestampMs(raw); ok {
-		return ms
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
 	}
-	w.logger.Debug("codex: failed to parse max ts", "session", sessionID, "table", table, "raw", string(raw))
-	return 0
+	return strings.Trim(string(raw), `"`)
 }
 
 func (w *Watcher) insertCodexSessionStart(sessionID string, ts time.Time, cwd, conversationID string, fctx *codexFileContext) {

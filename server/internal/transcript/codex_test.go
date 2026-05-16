@@ -189,7 +189,7 @@ func TestProcessCodexResponseItemEmitsReasoningSummary(t *testing.T) {
 	}
 }
 
-func TestProcessCodexLineSkipReplayKeepsConversationState(t *testing.T) {
+func TestProcessCodexLinePreseededReplayKeepsConversationState(t *testing.T) {
 	sqlCh := make(chan string, 1)
 	ts := httptest.NewServer(httpTestHandler(sqlCh))
 	defer ts.Close()
@@ -203,13 +203,16 @@ func TestProcessCodexLineSkipReplayKeepsConversationState(t *testing.T) {
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	seen := make(map[string]struct{})
-	fctx := &codexFileContext{skipUntilTsMs: time.Date(2026, 3, 27, 18, 11, 0, 0, time.UTC).UnixMilli()}
+	hookSeen := map[string]struct{}{
+		codexHookKey("SessionStart", "", "", "", "", "", "", "conv-replay", "/tmp/project"): {},
+	}
+	fctx := newCodexFileContext("", hookSeen)
 
 	w.processCodexLine("rollout-2026-03-27T18-10-59",
 		`{"timestamp":"2026-03-27T18:10:59Z","type":"session_meta","payload":{"id":"conv-replay","source":"vscode","cwd":"/tmp/project"}}`,
 		seen, fctx)
 	w.processCodexLine("rollout-2026-03-27T18-10-59",
-		`{"timestamp":"2026-03-27T18:11:01Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-new","arguments":"{}"}}`,
+		`{"timestamp":"2026-03-27T18:10:59Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-new","arguments":"{}"}}`,
 		seen, fctx)
 
 	sqls := []string{waitForSQL(t, sqlCh), waitForSQL(t, sqlCh)}
@@ -218,6 +221,79 @@ func TestProcessCodexLineSkipReplayKeepsConversationState(t *testing.T) {
 		if strings.Contains(sql, "SessionStart") {
 			t.Fatalf("old SessionStart should have been skipped, got %s", sql)
 		}
+	}
+}
+
+func TestCodexHookSeenDeduplicatesHookEvents(t *testing.T) {
+	sqlCh := make(chan string, 2)
+	ts := httptest.NewServer(httpTestHandler(sqlCh))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	fctx := newCodexFileContext("", nil)
+
+	for i := 0; i < 2; i++ {
+		w.processCodexLine("rollout-2026-03-27T18-10-59",
+			`{"timestamp":"2026-03-27T18:11:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}`,
+			nil, fctx)
+	}
+
+	sql := waitForSQL(t, sqlCh)
+	for _, want := range []string{"tma1_hook_events", "TaskCreated", "turn-1"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("expected SQL to contain %q, got %s", want, sql)
+		}
+	}
+	assertNoSQL(t, sqlCh)
+}
+
+func TestSeedCodexSeenStatePopulatesMessageAndHookKeys(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			w.WriteHeader(500)
+			return
+		}
+		sql := r.Form.Get("sql")
+		w.WriteHeader(200)
+		switch {
+		case strings.Contains(sql, "FROM tma1_messages"):
+			_, _ = w.Write([]byte(`{"output":[{"records":{"rows":[["assistant","assistant","","gpt-5.5",""],["tool_use","assistant","{}","gpt-5.5","call-1"]]}}]}`))
+		case strings.Contains(sql, "FROM tma1_hook_events"):
+			_, _ = w.Write([]byte(`{"output":[{"records":{"rows":[["PreToolUse","call-1","agent-1","review","exec_command","{}","","conv-1",""]]}}]}`))
+		default:
+			_, _ = w.Write([]byte(`{"output":[]}`))
+		}
+	}))
+	defer ts.Close()
+
+	oldClient := httpClient
+	httpClient = ts.Client()
+	defer func() { httpClient = oldClient }()
+
+	w := &Watcher{
+		sqlURL: ts.URL,
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	seen := make(map[string]struct{})
+	hookSeen := make(map[string]struct{})
+	w.seedCodexSeenState("rollout-2026-03-27T18-10-59", seen, hookSeen)
+
+	if _, ok := seen["model:gpt-5.5"]; !ok {
+		t.Fatalf("expected model key to be seeded, got %#v", seen)
+	}
+	if _, ok := seen[codexMessageSeenKey("tool_use", "assistant", "{}", "call-1")]; !ok {
+		t.Fatalf("expected tool message key to be seeded, got %#v", seen)
+	}
+	hookKey := codexHookKey("PreToolUse", "call-1", "agent-1", "review", "exec_command", "{}", "", "conv-1", "")
+	if _, ok := hookSeen[hookKey]; !ok {
+		t.Fatalf("expected hook key %q to be seeded, got %#v", hookKey, hookSeen)
 	}
 }
 
@@ -236,6 +312,15 @@ func assertAnySQLContains(t *testing.T, sqls []string, wants ...string) {
 		}
 	}
 	t.Fatalf("expected one SQL to contain %q, got %q", wants, sqls)
+}
+
+func assertNoSQL(t *testing.T, sqlCh <-chan string) {
+	t.Helper()
+	select {
+	case sql := <-sqlCh:
+		t.Fatalf("unexpected SQL insert: %s", sql)
+	case <-time.After(150 * time.Millisecond):
+	}
 }
 
 func httpTestHandler(sqlCh chan<- string) http.HandlerFunc {

@@ -10,7 +10,7 @@ function sess_renderAPICalls(stats) {
   var html = '<details class="sess-section">';
   html += '<summary>' + t('sessions.api_calls') + ' (' + calls.length + ') \u00B7 ' + fmtCost(stats.cost) + '</summary>';
   html += '<table class="sess-api-table"><thead><tr>';
-  html += '<th>' + t('sessions.api_col_model') + '</th><th>' + t('sessions.api_col_in') + '</th><th>' + t('sessions.api_col_out') + '</th><th>' + t('sessions.api_col_cache') + '</th><th>' + t('sessions.api_col_cost') + '</th><th>' + t('sessions.api_col_dur') + '</th>';
+  html += '<th>' + t('sessions.api_col_model') + '</th><th>' + t('sessions.api_col_in') + '</th><th>' + t('sessions.api_col_out') + '</th><th>' + t('sessions.api_col_reasoning') + '</th><th>' + t('sessions.api_col_cache') + '</th><th>' + t('sessions.api_col_cost') + '</th><th>' + t('sessions.api_col_dur') + '</th>';
   html += '</tr></thead><tbody>';
 
   for (var i = 0; i < calls.length; i++) {
@@ -25,6 +25,7 @@ function sess_renderAPICalls(stats) {
     html += '<td style="text-align:left;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHTML(c.model || '') + '">' + escapeHTML(modelShort) + '</td>';
     html += '<td>' + fmtTokens(c.inputTokens) + '</td>';
     html += '<td>' + fmtTokens(c.outputTokens) + '</td>';
+    html += '<td>' + (c.reasoningTokens > 0 ? fmtTokens(c.reasoningTokens) : '\u2014') + '</td>';
     html += '<td>' + (c.cacheTokens > 0 ? fmtTokens(c.cacheTokens) : '\u2014') + '</td>';
     html += '<td>' + fmtCost(c.cost) + '</td>';
     html += '<td>' + (c.durationMs > 0 ? (c.durationMs < 1000 ? Math.round(c.durationMs) + 'ms' : (c.durationMs / 1000).toFixed(1) + 's') : '\u2014') + '</td>';
@@ -36,6 +37,7 @@ function sess_renderAPICalls(stats) {
   html += '<td style="text-align:left">' + t('sessions.api_total') + '</td>';
   html += '<td>' + fmtTokens(stats.totalInputTokens) + '</td>';
   html += '<td>' + fmtTokens(stats.totalOutputTokens) + '</td>';
+  html += '<td>' + (stats.totalReasoningTokens > 0 ? fmtTokens(stats.totalReasoningTokens) : '\u2014') + '</td>';
   html += '<td>' + (stats.totalCacheTokens > 0 ? fmtTokens(stats.totalCacheTokens) : '\u2014') + '</td>';
   html += '<td>' + fmtCost(stats.cost) + '</td>';
   html += '<td></td>';

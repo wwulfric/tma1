@@ -253,14 +253,19 @@ async function sess_loadDetail(sessionId, agentSource) {
 
   var hookEvents = phase1[0] ? rowsToObjects(phase1[0]) : [];
   var messages = phase1[1] ? rowsToObjects(phase1[1]) : [];
+
+  // Infer agent source from hook data when not provided (e.g. search results).
+  if (!agentSource) {
+    for (var srcIdx = 0; srcIdx < hookEvents.length; srcIdx++) {
+      if (hookEvents[srcIdx].agent_source) {
+        agentSource = hookEvents[srcIdx].agent_source;
+        break;
+      }
+    }
+  }
   if (agentSource === 'codex') messages = sess_normalizeCodexTranscriptMessages(messages);
   hookEvents = sess_dedupHookEvents(hookEvents);
   messages = sess_dedupMessages(messages);
-
-  // Infer agent source from hook data when not provided (e.g. search results).
-  if (!agentSource && hookEvents.length > 0) {
-    agentSource = hookEvents[0].agent_source || '';
-  }
 
   // Merge tool pairs from hooks (PostToolUse with matching PreToolUse).
   var pending = {};
@@ -508,6 +513,10 @@ function sess_dedupMessages(messages) {
     var key;
     if ((msg.message_type === 'tool_use' || msg.message_type === 'tool_result') && msg.tool_use_id) {
       key = 'tool-msg:' + msg.message_type + ':' + msg.tool_use_id;
+    } else if (msg.message_type === 'llm') {
+      key = 'llm:' + (msg.tool_use_id || '') + ':' + tsToMs(msg.ts) + ':' + (msg.model || '') + ':' +
+        (msg.input_tokens || 0) + ':' + (msg.output_tokens || 0) + ':' +
+        (msg.cache_read_tokens || 0) + ':' + (msg.reasoning_tokens || 0) + ':' + (msg.duration_ms || 0);
     } else {
       key = 'msg:' + msg.message_type + ':' + Math.floor(tsToMs(msg.ts) / 5000) + ':' + String(msg.content || '').slice(0, 500);
     }
